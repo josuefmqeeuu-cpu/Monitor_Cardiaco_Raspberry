@@ -8,7 +8,7 @@ import os
 # --- CONFIGURACION ---
 MODO_SIMULACION = True 
 
-print("INICIANDO MONITOR CARDIACO CON IA (V4 - AutoZoom)...")
+print("INICIANDO MONITOR CARDIACO CON IA (V6 - Estabilizado)...")
 
 # 1. CARGAR CEREBRO IA
 if not os.path.exists('cerebro_ecg.joblib'):
@@ -26,17 +26,28 @@ if MODO_SIMULACION:
     
     print("Cargando señal...")
     ecg_completo = electrocardiogram()
-    # Usamos un tramo con arritmia clara para probar
     buffer_simulacion = ecg_completo[15000:15000+fs*300] 
+
+    # --- FILTRO DE LIMPIEZA ---
+    print("Aplicando filtros...")
+    filtro_suave = np.ones(15)/15 
+    ecg_limpia = np.convolve(buffer_simulacion, filtro_suave, mode='same')
+    filtro_lento = np.ones(300)/300 
+    ola_respiracion = np.convolve(buffer_simulacion, filtro_lento, mode='same')
+    buffer_simulacion = (ecg_limpia - ola_respiracion) * 2.0
 
 # Variables de visualización
 ventana_seg = 3
 muestras_ventana = ventana_seg * fs
 datos_display = np.zeros(muestras_ventana)
 
-# Memoria para VFC
+# Memorias
 memoria_vfc = [] 
 max_memoria = 30 * fs 
+
+# --- NUEVO: MEMORIA PARA ESTABILIZAR BPM ---
+historial_bpm = [] 
+max_historial_bpm = 20 # Promediaremos los ultimos 20 cuadros
 
 # --- FIGURA ---
 fig = plt.figure(figsize=(10, 8), facecolor='#f0f0f0')
@@ -52,7 +63,7 @@ ax1.set_ylabel('Voltaje (mV)')
 texto_diag = ax1.text(0.5, 0.9, "Iniciando...", transform=ax1.transAxes, 
                      ha="center", fontsize=12, bbox=dict(facecolor='white'))
 
-# Grafica 2: Estrés (Configuracion inicial)
+# Grafica 2: Estrés
 ax2 = fig.add_subplot(2, 1, 2)
 ax2.set_xlabel('Frecuencia (Hz)')
 ax2.grid(True)
@@ -61,10 +72,10 @@ ax2.grid(True)
 idx_simulacion = 0
 
 def update(frame):
-    global idx_simulacion, datos_display, memoria_vfc
+    global idx_simulacion, datos_display, memoria_vfc, historial_bpm
     
     # A. LEER DATOS
-    chunk = 15 
+    chunk = 40 # Velocidad rapida
     if MODO_SIMULACION:
         inicio = idx_simulacion
         fin = idx_simulacion + chunk
@@ -81,7 +92,7 @@ def update(frame):
     datos_display = np.roll(datos_display, -len(nuevos))
     datos_display[-len(nuevos):] = nuevos
     
-    # C. MEMORIA
+    # C. MEMORIA VFC
     memoria_vfc.extend(nuevos)
     if len(memoria_vfc) > max_memoria:
         del memoria_vfc[:len(nuevos)]
@@ -90,26 +101,36 @@ def update(frame):
     eje_x = np.linspace(0, ventana_seg, len(datos_display))
     linea_ecg.set_data(eje_x, datos_display)
     
-    # E. ANALISIS RAPIDO (IA)
+    # E. ANALISIS DE BPM (ESTABILIZADO)
     picos, props = find_peaks(datos_display, height=0.6, distance=100)
+    
     if len(picos) > 1:
+        # Calculo instantaneo
         rr = np.diff(picos) / fs
-        bpm = 60 / np.mean(rr)
-        voltaje = np.mean(props['peak_heights'])
-        prediccion = modelo_ia.predict([[bpm, voltaje]])[0]
+        bpm_inst = 60 / np.mean(rr)
         
-        if bpm < 100: 
+        # --- ESTABILIZACION (COLA DE PROMEDIO) ---
+        historial_bpm.append(bpm_inst)
+        if len(historial_bpm) > max_historial_bpm:
+            historial_bpm.pop(0) # Borrar el mas viejo
+            
+        # Usamos el PROMEDIO, no el instantaneo
+        bpm_suave = np.mean(historial_bpm)
+        
+        # Diagnostico con el valor suave
+        voltaje = np.mean(props['peak_heights'])
+        
+        if bpm_suave < 100: 
             estado = "RITMO NORMAL"
             col = "#ccffcc" 
         else:
             estado = "!!! ARRITMIA DETECTADA !!!"
             col = "#ffcccc" 
             
-        texto_diag.set_text(f"BPM: {bpm:.0f} | IA: {estado}")
+        texto_diag.set_text(f"BPM Promedio: {bpm_suave:.0f} | IA: {estado}")
         texto_diag.set_bbox(dict(facecolor=col, alpha=0.8))
 
-    # F. ANALISIS LENTO (ESTRÉS - VFC)
-    # Solo entramos aqui cada 30 cuadros Y si tenemos datos suficientes
+    # F. ANALISIS ESTRÉS (Cada 30 cuadros)
     if frame % 30 == 0 and len(memoria_vfc) > 10*fs:
         
         datos_largo = np.array(memoria_vfc)
@@ -122,25 +143,19 @@ def update(frame):
             t_interp = np.arange(t_rr[0], t_rr[-1], 0.25) 
             if len(t_interp) > 10:
                 rr_interp = np.interp(t_interp, t_rr, rr_largo)
-                
-                # --- CORRECCION DEL ERROR nperseg ---
-                # Calculamos nperseg dinamicamente para que nunca falle
                 n_seg = min(256, len(rr_interp))
                 f, p = welch(rr_interp, fs=4, nperseg=n_seg)
                 
-                # --- CORRECCION VISUAL (REDIBUJAR TODO) ---
-                ax2.clear() # Borramos lo viejo
+                ax2.clear() 
                 ax2.grid(True)
                 ax2.set_xlabel('Frecuencia (Hz)')
                 ax2.set_xlim(0, 0.5)
-                # NO FIJAMOS EL LIMITE Y, dejamos que matplotlib haga auto-zoom
                 
                 ax2.plot(f, p, 'k-', lw=1)
                 ax2.fill_between(f, p, where=(f>=0.04)&(f<0.15), color='red', alpha=0.5, label='LF (Estrés)')
                 ax2.fill_between(f, p, where=(f>=0.15)&(f<0.40), color='green', alpha=0.5, label='HF (Relax)')
                 ax2.legend(loc='upper right')
 
-                # Ratio
                 lf = np.trapz(p[(f>=0.04) & (f<0.15)], f[(f>=0.04) & (f<0.15)])
                 hf = np.trapz(p[(f>=0.15) & (f<0.40)], f[(f>=0.15) & (f<0.40)])
                 ratio = lf/hf if hf > 0 else 0
